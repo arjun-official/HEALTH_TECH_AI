@@ -76,6 +76,14 @@ Healthcare emergencies often face delays due to fragmented medical records, manu
 * **Automation:** n8n
 * **Version Control:** Git & GitHub
 
+## Current Frontend Persistence
+
+The VITALYX prototype currently uses a typed local mock database in `src/db.ts`. It stores demonstration routines, alerts, and appointment changes in browser `localStorage`, so interactions remain available after navigation and refresh. This is intentionally local-only and contains no real patient information.
+
+Public **Create account** opens the common registration form for Admin, Doctor, and Emergency Service accounts. Admin accounts become active immediately; Doctor and Emergency Service accounts are stored as pending until the special-permission policy is defined. Patients cannot self-register. Signed-in administrators can use **Add member** repeatedly to create authorised patient or staff member accounts with Mail, Number, Name, Date of Birth, Profession, Address, role, and password.
+
+For production, replace the `loadDatabase` and `saveDatabase` functions with authenticated API calls to the planned Django/FastAPI service and PostgreSQL/Supabase database. Do not store real health records or credentials in browser storage.
+
 ## Future Enhancements
 
 * Integration with Smart Rings and Smart Watches
