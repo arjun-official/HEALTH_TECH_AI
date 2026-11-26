@@ -1,6 +1,6 @@
 import {
     Activity, AlertTriangle, Ambulance, ArrowRight, Bell, CalendarDays, Check, ChevronRight,
-    CircleHelp, ClipboardList, Clock3, FileText, HeartPulse, Home, LogOut, Menu, MessageCircle,
+    CircleHelp, ClipboardList, Clock3, FileText, HeartPulse, Home, LogOut, Menu,
     Pill, Plus, Search, ShieldCheck, Siren, Stethoscope, Users, X, Zap,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
@@ -9,6 +9,8 @@ import { AdminOnboarding, AdminWorkspace } from './AdminWorkflow'
 import { CreateAccountForm } from './CreateAccountForm'
 import { loadDatabase, saveDatabase, type Account } from './db'
 import { DoctorPortal } from './DoctorPortal'
+import { loadPatientDashboardData, type Observation, type PatientAppointment, type PatientDashboardData } from './patientData'
+import { signInWithGoogle, supabase } from './supabase'
 import './style.css'
 
 type Role = 'patient' | 'admin' | 'doctor' | 'emergency'
@@ -16,7 +18,7 @@ type Icon = typeof Home
 
 type NavItem = { label: string; path: string; icon: Icon }
 
-type User = Account
+type User = Account & { authUserId?: string }
 
 const nav: Record<Role, NavItem[]> = {
   patient: [
@@ -65,14 +67,95 @@ const appointments = [
 
 function getRolePath(role: Role) { return `/${role}/dashboard` }
 
+function isRole(value: unknown): value is Role {
+  return value === 'patient' || value === 'admin' || value === 'doctor' || value === 'emergency'
+}
+
+function getRoleTitle(role: Role) {
+  const titles: Record<Role, string> = {
+    patient: 'Patient account',
+    admin: 'Family administrator',
+    doctor: 'Clinical professional',
+    emergency: 'Emergency operations',
+  }
+  return titles[role]
+}
+
+function getErrorMessage(error: unknown) {
+  return error instanceof Error ? error.message : 'An unexpected error occurred.'
+}
+
+async function loadAppUser(authUser: { id: string; email?: string | null; user_metadata?: { full_name?: string }; app_metadata?: { providers?: string[] } }): Promise<User | null> {
+  const [{ data: profile, error: profileError }, { data: roleRows, error: rolesError }] = await Promise.all([
+    supabase.from('profiles').select('full_name').eq('user_id', authUser.id).maybeSingle(),
+    supabase.from('user_roles').select('role').eq('user_id', authUser.id),
+  ])
+  if (profileError) throw new Error(`Could not load your profile: ${profileError.message}`)
+  if (rolesError) throw new Error(`Could not load your account role: ${rolesError.message}`)
+
+  const role = roleRows?.[0]?.role
+  if (!isRole(role)) return null
+
+  return {
+    authUserId: authUser.id,
+    email: authUser.email ?? '',
+    password: '',
+    role,
+    name: (authUser.app_metadata?.providers?.includes('google') && authUser.user_metadata?.full_name)
+      || profile?.full_name
+      || authUser.email
+      || 'VITALYX user',
+    title: getRoleTitle(role),
+    access: 'active',
+  }
+}
+
 function App() {
   const [database, setDatabase] = useState(loadDatabase)
   const [user, setUser] = useState<User | null>(null)
   const [path, setPath] = useState(window.location.pathname || '/')
   const [loginError, setLoginError] = useState('')
+  const [isGoogleLoading, setIsGoogleLoading] = useState(false)
   const [showEmergency, setShowEmergency] = useState(false)
   const [mobileNav, setMobileNav] = useState(false)
   const [darkMode, setDarkMode] = useState(() => window.localStorage.getItem('vitalyx-dark-mode') === 'true')
+
+  useEffect(() => {
+    let alive = true
+    const showRestoreError = (message: string) => {
+      if (!alive) return
+      setLoginError(message)
+      setPath('/login')
+      window.history.replaceState({}, '', '/login')
+    }
+    const restoreSession = async () => {
+      try {
+        const { data, error } = await supabase.auth.getSession()
+        if (!alive || !data.session?.user) {
+          if (error) showRestoreError(error.message)
+          return
+        }
+        if (error) {
+          showRestoreError(error.message)
+          return
+        }
+        const restoredUser = await loadAppUser(data.session.user)
+        if (!alive) return
+        if (!restoredUser) {
+          const { error: signOutError } = await supabase.auth.signOut()
+          showRestoreError(signOutError
+            ? `Your account has no approved VITALYX role, and sign-out failed: ${signOutError.message}`
+            : 'Your account has no approved VITALYX role. Contact an administrator.')
+          return
+        }
+        setUser(restoredUser)
+      } catch (error) {
+        showRestoreError(getErrorMessage(error))
+      }
+    }
+    void restoreSession()
+    return () => { alive = false }
+  }, [])
 
   const navigate = (nextPath: string) => {
     window.history.pushState({}, '', nextPath)
@@ -80,28 +163,68 @@ function App() {
     setMobileNav(false)
   }
 
-  const login = (email: string, password: string) => {
-    const found = database.accounts.find((candidate) => candidate.email === email && candidate.password === password)
-    if (!found) { setLoginError('That email and password combination is not recognised.'); return }
-    if (found.access === 'pending') { setLoginError('This account is awaiting special permission before it can sign in.'); return }
-    setUser(found)
-    navigate(getRolePath(found.role))
+  const login = async (email: string, password: string) => {
+    setLoginError('')
+    try {
+      const { data: authData, error: authError } = await supabase.auth.signInWithPassword({ email, password })
+      if (authError || !authData.user) {
+        setLoginError(authError?.message ?? 'Sign in failed.')
+        return
+      }
+      const signedInUser = await loadAppUser(authData.user)
+      if (!signedInUser) {
+        const { error: signOutError } = await supabase.auth.signOut()
+        setLoginError(signOutError
+          ? `Your account has no approved VITALYX role, and sign-out failed: ${signOutError.message}`
+          : 'Your account has no approved VITALYX role. Contact an administrator.')
+        return
+      }
+      setUser(signedInUser)
+      navigate(getRolePath(signedInUser.role))
+    } catch (error) {
+      setLoginError(getErrorMessage(error))
+    }
+  }
+
+  const loginWithGoogle = async () => {
+    setLoginError('')
+    setIsGoogleLoading(true)
+    try {
+      await signInWithGoogle()
+    } catch (error) {
+      setLoginError(getErrorMessage(error))
+      setIsGoogleLoading(false)
+    }
+  }
+
+  const logout = async () => {
+    try {
+      const { error } = await supabase.auth.signOut()
+      if (error) {
+        window.alert(`Sign out failed: ${error.message}`)
+        return
+      }
+      setUser(null)
+      navigate('/')
+    } catch (error) {
+      window.alert(`Sign out failed: ${getErrorMessage(error)}`)
+    }
   }
 
   if (!user && path === '/') return <Landing onLogin={() => navigate('/login')} onStart={() => navigate('/login')} />
-  if (!user && path === '/login') return <Login onLogin={login} error={loginError} onBack={() => navigate('/')} onCreateAccount={() => navigate('/register')} />
+  if (!user && path === '/login') return <Login onLogin={login} onGoogleLogin={loginWithGoogle} isGoogleLoading={isGoogleLoading} error={loginError} onBack={() => navigate('/')} onCreateAccount={() => navigate('/register')} />
   if (!user && path === '/register') return <Register database={database} updateDatabase={(nextDatabase) => { setDatabase(nextDatabase); saveDatabase(nextDatabase) }} onBack={() => navigate('/login')} onCreated={() => navigate('/login')} allowPatient={false} />
-  if (!user) return <Login onLogin={login} error="Please sign in to continue." onBack={() => navigate('/')} onCreateAccount={() => navigate('/register')} />
+  if (!user) return <Login onLogin={login} onGoogleLogin={loginWithGoogle} isGoogleLoading={isGoogleLoading} error="Please sign in to continue." onBack={() => navigate('/')} onCreateAccount={() => navigate('/register')} />
 
   const updateDatabase = (nextDatabase: typeof database) => { setDatabase(nextDatabase); saveDatabase(nextDatabase) }
   const toggleDarkMode = () => { const next = !darkMode; setDarkMode(next); window.localStorage.setItem('vitalyx-dark-mode', String(next)) }
   const updateUser = (nextUser: User) => { setUser(nextUser); updateDatabase({ ...database, accounts: database.accounts.map((account) => account.email === nextUser.email ? nextUser : account) }) }
   if (user.role === 'admin' && !user.onboardingComplete) return <AdminOnboarding user={user} database={database} updateDatabase={updateDatabase} updateUser={updateUser} navigate={navigate} />
-  return <AppShell user={user} path={path} navigate={navigate} mobileNav={mobileNav} setMobileNav={setMobileNav} logout={() => { setUser(null); navigate('/') }} database={database} updateDatabase={updateDatabase} showEmergency={showEmergency} setShowEmergency={setShowEmergency} darkMode={darkMode} toggleDarkMode={toggleDarkMode} />
+  return <AppShell user={user} path={path} navigate={navigate} mobileNav={mobileNav} setMobileNav={setMobileNav} logout={logout} database={database} updateDatabase={updateDatabase} showEmergency={showEmergency} setShowEmergency={setShowEmergency} darkMode={darkMode} toggleDarkMode={toggleDarkMode} />
 }
 
 function Register({ database, updateDatabase, onBack, onCreated, allowPatient }: { database: ReturnType<typeof loadDatabase>; updateDatabase: (database: ReturnType<typeof loadDatabase>) => void; onBack: () => void; onCreated: () => void; allowPatient: boolean }) {
-  return <CreateAccountForm database={database} updateDatabase={updateDatabase} onBack={onBack} onCreated={onCreated} allowPatient={allowPatient} />
+  return <CreateAccountForm database={database} updateDatabase={updateDatabase} onBack={onBack} onCreated={onCreated} isAdminAddingMember={allowPatient} />
   const [email, setEmail] = useState('')
   const [name, setName] = useState('')
   const [dateOfBirth, setDateOfBirth] = useState('')
@@ -134,20 +257,20 @@ function Landing({ onLogin, onStart }: { onLogin: () => void; onStart: () => voi
 
 function Feature({ icon: FeatureIcon, title, text }: { icon: Icon; title: string; text: string }) { return <article className="feature-item"><span className="feature-icon"><FeatureIcon size={20} /></span><h3>{title}</h3><p>{text}</p></article> }
 
-function Login({ onLogin, error, onBack, onCreateAccount }: { onLogin: (email: string, password: string) => void; error: string; onBack: () => void; onCreateAccount: () => void }) {
+function Login({ onLogin, onGoogleLogin, isGoogleLoading, error, onBack, onCreateAccount }: { onLogin: (email: string, password: string) => void; onGoogleLogin: () => void; isGoogleLoading: boolean; error: string; onBack: () => void; onCreateAccount: () => void }) {
   const [email, setEmail] = useState(''); const [password, setPassword] = useState(''); const [showPassword, setShowPassword] = useState(false)
-  return <div className="login-page"><button className="login-back" onClick={onBack}><ChevronRight size={16} className="rotate-back" /> Back to home</button><div className="login-layout"><div className="login-intro"><Brand /><div><span className="eyebrow">Welcome back</span><h1>Care, in one<br /><em>clear place.</em></h1><p>Your health dashboard is ready when you are. Sign in to continue.</p></div></div><div className="login-card"><div className="card-kicker">Secure sign in</div><h2>Continue to VITALYX</h2><p className="muted">Enter your account details to continue.</p><form onSubmit={(event) => { event.preventDefault(); onLogin(email, password) }}><label>Email address<input type="email" value={email} onChange={(event) => setEmail(event.target.value)} required autoComplete="email" /></label><label>Password<div className="password-field"><input type={showPassword ? 'text' : 'password'} value={password} onChange={(event) => setPassword(event.target.value)} required autoComplete="current-password" /><button type="button" onClick={() => setShowPassword(!showPassword)}>{showPassword ? 'Hide' : 'Show'}</button></div></label>{error && <div className="form-error"><AlertTriangle size={15} />{error}</div>}<button className="button button-primary button-wide" type="submit">Sign in <ArrowRight size={17} /></button></form><button className="create-account-link" onClick={onCreateAccount}>Create account <ArrowRight size={15} /></button><div className="login-foot"><ShieldCheck size={15} /> Protected access</div></div></div></div>
+  return <div className="login-page"><button className="login-back" onClick={onBack}><ChevronRight size={16} className="rotate-back" /> Back to home</button><div className="login-layout"><div className="login-intro"><Brand /><div><span className="eyebrow">Welcome back</span><h1>Care, in one<br /><em>clear place.</em></h1><p>Your health dashboard is ready when you are. Sign in to continue.</p></div></div><div className="login-card"><div className="card-kicker">Secure sign in</div><h2>Continue to VITALYX</h2><p className="muted">Enter your account details to continue.</p><form onSubmit={(event) => { event.preventDefault(); onLogin(email, password) }}><label>Email address<input type="email" value={email} onChange={(event) => setEmail(event.target.value)} required autoComplete="email" /></label><label>Password<div className="password-field"><input type={showPassword ? 'text' : 'password'} value={password} onChange={(event) => setPassword(event.target.value)} required autoComplete="current-password" /><button type="button" onClick={() => setShowPassword(!showPassword)}>{showPassword ? 'Hide' : 'Show'}</button></div></label>{error && <div className="form-error"><AlertTriangle size={15} />{error}</div>}<button className="button button-primary button-wide" type="submit">Sign in <ArrowRight size={17} /></button></form><div className="auth-divider"><span>or</span></div><button className="button button-google button-wide" type="button" onClick={onGoogleLogin} disabled={isGoogleLoading}><span className="google-mark" aria-hidden="true">G</span>{isGoogleLoading ? 'Redirecting to Google...' : 'Continue with Google'}</button><button className="create-account-link" onClick={onCreateAccount}>Create account <ArrowRight size={15} /></button><div className="login-foot"><ShieldCheck size={15} /> Protected access</div></div></div></div>
 }
 
 function AppShell({ user, path, navigate, mobileNav, setMobileNav, logout, database, updateDatabase, showEmergency, setShowEmergency, darkMode, toggleDarkMode }: { user: User; path: string; navigate: (nextPath: string) => void; mobileNav: boolean; setMobileNav: (value: boolean) => void; logout: () => void; database: ReturnType<typeof loadDatabase>; updateDatabase: (database: ReturnType<typeof loadDatabase>) => void; showEmergency: boolean; setShowEmergency: (value: boolean) => void; darkMode: boolean; toggleDarkMode: () => void }) {
   const safePath = path.startsWith(`/${user.role}/`) ? path : getRolePath(user.role)
   useEffect(() => { if (safePath !== path) navigate(safePath) }, [navigate, path, safePath])
   const currentNav = nav[user.role]; const currentItem = currentNav.find((item) => safePath === item.path) ?? currentNav[0]
-  return <div className={`app-shell role-${user.role} ${darkMode ? 'dark-mode' : ''}`}><aside className={`sidebar ${mobileNav ? 'sidebar-open' : ''}`}><div className="sidebar-head"><Brand /><button className="mobile-close" onClick={() => setMobileNav(false)}><X size={20} /></button></div><div className="role-switch"><span className="avatar">{user.name.split(' ').map((word) => word[0]).join('').slice(0, 2)}</span><span><strong>{user.name}</strong><small>{user.title}</small></span><ChevronRight size={14} /></div><nav className="side-nav">{currentNav.map((item) => <button key={item.path} className={currentItem.path === item.path ? 'active' : ''} onClick={() => navigate(item.path)}><item.icon size={18} /><span>{item.label}</span></button>)}</nav><div className="sidebar-bottom"><button className="support-link" onClick={() => navigate(`/${user.role}/support`)}><CircleHelp size={17} /> Help & support</button><button className="logout-link" onClick={logout}><LogOut size={17} /> Sign out</button><div className="privacy-note"><ShieldCheck size={15} /><span>Demo environment<br />No real medical data</span></div></div></aside><div className="main-column"><header className="app-header"><button className="mobile-menu" onClick={() => setMobileNav(true)}><Menu size={21} /></button><div><span className="breadcrumb">{user.role === 'emergency' ? 'Operations' : 'Workspace'} <ChevronRight size={13} /> {currentItem.label}</span><h1>{currentItem.label}</h1></div><div className="header-actions"><button className="icon-button theme-toggle" onClick={toggleDarkMode} aria-label="Toggle dark mode">{darkMode ? '☀' : '☾'}</button><button className="icon-button notification-button" onClick={() => navigate(`/${user.role}/alerts`)}><Bell size={18} /><i /></button><div className="header-user"><span className="avatar avatar-sm">{user.name.split(' ').map((word) => word[0]).join('').slice(0, 2)}</span><span><strong>{user.name}</strong><small>{user.role === 'patient' ? 'Personal space' : user.title}</small></span></div></div></header><main className="content"><RolePage user={user} path={safePath} navigate={navigate} database={database} updateDatabase={updateDatabase} setShowEmergency={setShowEmergency} darkMode={darkMode} toggleDarkMode={toggleDarkMode} /></main></div>{showEmergency && <EmergencyModal close={() => setShowEmergency(false)} />}</div>
+  return <div className={`app-shell role-${user.role} ${darkMode ? 'dark-mode' : ''}`}><aside className={`sidebar ${mobileNav ? 'sidebar-open' : ''}`}><div className="sidebar-head"><Brand /><button className="mobile-close" onClick={() => setMobileNav(false)}><X size={20} /></button></div><div className="role-switch"><span className="avatar">{user.name.split(' ').map((word) => word[0]).join('').slice(0, 2)}</span><span><strong>{user.name}</strong><small>{user.title}</small></span><ChevronRight size={14} /></div><nav className="side-nav">{currentNav.map((item) => <button key={item.path} className={currentItem.path === item.path ? 'active' : ''} onClick={() => navigate(item.path)}><item.icon size={18} /><span>{item.label}</span></button>)}</nav><div className="sidebar-bottom"><button className="support-link" onClick={() => navigate(`/${user.role}/support`)}><CircleHelp size={17} /> Help & support</button><button className="logout-link" onClick={logout}><LogOut size={17} /> Sign out</button><div className="privacy-note"><ShieldCheck size={15} /><span>{user.role === 'patient' ? <>Read-only patient data<br />Other areas may be demo</> : <>Demo environment<br />No real medical data</>}</span></div></div></aside><div className="main-column"><header className="app-header"><button className="mobile-menu" onClick={() => setMobileNav(true)}><Menu size={21} /></button><div><span className="breadcrumb">{user.role === 'emergency' ? 'Operations' : 'Workspace'} <ChevronRight size={13} /> {currentItem.label}</span><h1>{currentItem.label}</h1></div><div className="header-actions"><button className="icon-button theme-toggle" onClick={toggleDarkMode} aria-label="Toggle dark mode">{darkMode ? '☀' : '☾'}</button><button className="icon-button notification-button" onClick={() => navigate(`/${user.role}/alerts`)}><Bell size={18} /><i /></button><div className="header-user"><span className="avatar avatar-sm">{user.name.split(' ').map((word) => word[0]).join('').slice(0, 2)}</span><span><strong>{user.name}</strong><small>{user.role === 'patient' ? 'Personal space' : user.title}</small></span></div></div></header><main className="content"><RolePage user={user} path={safePath} navigate={navigate} database={database} updateDatabase={updateDatabase} setShowEmergency={setShowEmergency} darkMode={darkMode} toggleDarkMode={toggleDarkMode} /></main></div>{showEmergency && <EmergencyModal close={() => setShowEmergency(false)} />}</div>
 }
 
 function RolePage({ user, path, navigate, database, updateDatabase, setShowEmergency, darkMode, toggleDarkMode }: { user: User; path: string; navigate: (nextPath: string) => void; database: ReturnType<typeof loadDatabase>; updateDatabase: (database: ReturnType<typeof loadDatabase>) => void; setShowEmergency: (value: boolean) => void; darkMode: boolean; toggleDarkMode: () => void }) {
-  if (user.role === 'patient') return <PatientPage path={path} navigate={navigate} database={database} updateDatabase={updateDatabase} setShowEmergency={setShowEmergency} />
+  if (user.role === 'patient') return <PatientWorkspace user={user} path={path} navigate={navigate} database={database} updateDatabase={updateDatabase} setShowEmergency={setShowEmergency} />
   if (user.role === 'admin') return <AdminWorkspace user={user} database={database} updateDatabase={updateDatabase} navigate={navigate} />
   if (user.role === 'doctor') return <DoctorPortal user={user} path={path} navigate={navigate} database={database} updateDatabase={updateDatabase} darkMode={darkMode} toggleDarkMode={toggleDarkMode} />
   return <EmergencyPage path={path} navigate={navigate} />
@@ -156,26 +279,151 @@ function RolePage({ user, path, navigate, database, updateDatabase, setShowEmerg
 function PageHeading({ eyebrow, title, subtitle, action }: { eyebrow?: string; title: string; subtitle?: string; action?: React.ReactNode }) { return <div className="page-heading"><div>{eyebrow && <span className="eyebrow">{eyebrow}</span>}<h2>{title}</h2>{subtitle && <p>{subtitle}</p>}</div>{action}</div> }
 function StatCard({ label, value, note, icon: StatIcon, tone = 'blue' }: { label: string; value: string; note: string; icon: Icon; tone?: string }) { return <div className="stat-card"><span className={`stat-icon ${tone}`}><StatIcon size={19} /></span><div><small>{label}</small><strong>{value}</strong><span className={`stat-note ${tone}`}>{note}</span></div></div> }
 function StatusPill({ children, tone = 'green' }: { children: React.ReactNode; tone?: string }) { return <span className={`status-pill ${tone}`}><i />{children}</span> }
-function TrendChart({ color = 'blue' }: { color?: string }) { return <div className={`trend-chart ${color}`}><div className="trend-path" /><span /><span /><span /></div> }
+type PatientLoadState =
+  | { status: 'loading' }
+  | { status: 'error'; message: string }
+  | { status: 'ready'; data: PatientDashboardData }
 
-function PatientPage({ path, navigate, database, updateDatabase, setShowEmergency }: { path: string; navigate: (nextPath: string) => void; database: ReturnType<typeof loadDatabase>; updateDatabase: (database: ReturnType<typeof loadDatabase>) => void; setShowEmergency: (value: boolean) => void }) {
-  if (path === '/patient/health') return <PatientHealth />
+function PatientWorkspace({ user, path, navigate, database, updateDatabase, setShowEmergency }: { user: User; path: string; navigate: (nextPath: string) => void; database: ReturnType<typeof loadDatabase>; updateDatabase: (database: ReturnType<typeof loadDatabase>) => void; setShowEmergency: (value: boolean) => void }) {
+  const [loadState, setLoadState] = useState<PatientLoadState>({ status: 'loading' })
+  const [attempt, setAttempt] = useState(0)
+
+  useEffect(() => {
+    let active = true
+    setLoadState({ status: 'loading' })
+    if (!user.authUserId) {
+      setLoadState({ status: 'error', message: 'Your authenticated account could not be identified. Sign out and sign in again.' })
+      return () => { active = false }
+    }
+
+    void loadPatientDashboardData(user.authUserId)
+      .then((data) => { if (active) setLoadState({ status: 'ready', data }) })
+      .catch((error: unknown) => {
+        if (active) setLoadState({ status: 'error', message: getErrorMessage(error) })
+      })
+    return () => { active = false }
+  }, [attempt, user.authUserId])
+
+  if (loadState.status === 'loading') return <div className="panel data-state" role="status">Loading your patient data…</div>
+  if (loadState.status === 'error') return <div className="panel data-state" role="alert"><strong>Patient data could not be loaded</strong><p>{loadState.message}</p><button className="button button-primary" onClick={() => setAttempt((value) => value + 1)}>Try again</button></div>
+
+  return <PatientPage user={user} path={path} navigate={navigate} database={database} updateDatabase={updateDatabase} setShowEmergency={setShowEmergency} dashboard={loadState.data} />
+}
+
+function normalizeObservationCode(code: string) {
+  return code.trim().toLowerCase().replace(/[\s-]+/g, '_')
+}
+
+function observationLabel(code: string) {
+  const labels: Record<string, string> = {
+    heart_rate: 'Heart rate',
+    heartrate: 'Heart rate',
+    resting_heart_rate: 'Resting heart rate',
+    blood_oxygen: 'Blood oxygen',
+    spo2: 'Blood oxygen',
+    oxygen_saturation: 'Blood oxygen',
+    hrv: 'Heart rate variability',
+    skin_temperature: 'Skin temperature',
+    activity: 'Activity',
+    steps: 'Steps',
+    step_count: 'Steps',
+    sleep: 'Sleep',
+    sleep_duration: 'Sleep duration',
+  }
+  const normalized = normalizeObservationCode(code)
+  return labels[normalized] ?? normalized.replace(/_/g, ' ').replace(/\b\w/g, (letter) => letter.toUpperCase())
+}
+
+function latestObservations(observations: Observation[]) {
+  const latest = new Map<string, Observation>()
+  for (const observation of observations) {
+    const key = normalizeObservationCode(observation.code)
+    if (!latest.has(key)) latest.set(key, observation)
+  }
+  return [...latest.values()]
+}
+
+function formatRecordedAt(value: string) {
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? 'Time unavailable' : date.toLocaleString()
+}
+
+function formatAppointmentDate(value: string) {
+  const date = new Date(value)
+  return Number.isNaN(date.getTime())
+    ? 'Date unavailable'
+    : date.toLocaleString(undefined, { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
+}
+
+function PatientPage({ user, path, navigate, database, updateDatabase, setShowEmergency, dashboard }: { user: User; path: string; navigate: (nextPath: string) => void; database: ReturnType<typeof loadDatabase>; updateDatabase: (database: ReturnType<typeof loadDatabase>) => void; setShowEmergency: (value: boolean) => void; dashboard: PatientDashboardData }) {
+  const recentObservations = latestObservations(dashboard.observations)
+
+  if (path === '/patient/health') return <PatientHealth observations={dashboard.observations} />
   if (path === '/patient/routines') return <RoutinePage routineDone={database.routineDone} setRoutineDone={(routineDone) => updateDatabase({ ...database, routineDone })} />
   if (path === '/patient/medications') return <MedicationPage />
-  if (path === '/patient/appointments') return <AppointmentsPage appointments={database.appointments} />
+  if (path === '/patient/appointments') return <AppointmentsPage appointments={dashboard.appointments} count={dashboard.upcomingAppointmentCount} />
   if (path === '/patient/reports') return <RecordsPage />
-   return <><PageHeading eyebrow="Tuesday, 24 November 2026" title="Good morning, Alex" subtitle="Here’s your health picture for today." action={<button className="button button-danger" onClick={() => setShowEmergency(true)}><Siren size={17} /> Need urgent help</button>} /><div className="notice-banner"><span><ShieldCheck size={18} /><strong>Everything looks steady</strong><small>Your latest readings are within your usual range.</small></span><button className="text-button" onClick={() => navigate('/patient/health')}>View health <ArrowRight size={15} /></button></div><div className="stats-grid"><StatCard label="Overall status" value="Good" note="Within your baseline" icon={HeartPulse} tone="green" /><StatCard label="Resting heart rate" value="64 bpm" note="↓ 3 bpm this week" icon={Activity} tone="blue" /><StatCard label="Sleep last night" value="7h 42m" note="Great recovery" icon={Zap} tone="amber" /><StatCard label="Routine progress" value={`${database.routineDone.filter(Boolean).length} / 5`} note="Keep your rhythm" icon={ClipboardList} tone="violet" /></div><div className="dashboard-grid"><section className="panel health-panel"><div className="panel-heading"><div><span className="eyebrow">Live snapshot</span><h3>Your health, at a glance</h3></div><button className="icon-button" onClick={() => navigate('/patient/health')}><ArrowRight size={17} /></button></div><div className="metric-list"><MetricRow label="Heart rate" value="64" unit="BPM" note="Resting · 5 min ago" trend="-3%" icon={HeartPulse} tone="red" /><MetricRow label="Blood oxygen" value="98" unit="%" note="Stable · 5 min ago" trend="+1%" icon={Activity} tone="blue" /><MetricRow label="Activity" value="8,420" unit="STEPS" note="68% of daily goal" trend="68%" icon={Zap} tone="amber" /></div></section><section className="panel routine-panel"><div className="panel-heading"><div><span className="eyebrow">Your rhythm</span><h3>Daily routine</h3></div><button className="text-button" onClick={() => navigate('/patient/routines')}>See all <ArrowRight size={15} /></button></div><div className="routine-progress"><div><strong>{database.routineDone.filter(Boolean).length} of 5</strong><span>tasks completed</span></div><div className="progress-bar"><i style={{ width: `${database.routineDone.filter(Boolean).length * 20}%` }} /></div></div><div className="task-list">{['Morning medication', '20 minute walk', 'Drink 6 glasses of water'].map((task, index) => <button className={`task-row ${database.routineDone[index] ? 'done' : ''}`} key={task} onClick={() => { const next = [...database.routineDone]; next[index] = !next[index]; updateDatabase({ ...database, routineDone: next }) }}><span className="check-box">{database.routineDone[index] && <Check size={14} />}</span><span>{task}</span>{database.routineDone[index] ? <small>Done</small> : <ChevronRight size={15} />}</button>)}</div></section></div><div className="bottom-grid"><section className="panel"><div className="panel-heading"><div><span className="eyebrow">Next up</span><h3>Appointments</h3></div><button className="text-button" onClick={() => navigate('/patient/appointments')}>View calendar <ArrowRight size={15} /></button></div><div className="appointment-row"><span className="date-tile"><b>27</b><small>NOV</small></span><div><strong>Dr. Jordan Lee</strong><span>Recovery review · Video call</span></div><span className="time-label">10:30 AM</span></div></section><section className="panel alert-panel"><div className="panel-heading"><div><span className="eyebrow">Keep an eye on</span><h3>Recent alerts</h3></div><Bell size={18} className="muted-icon" /></div>{database.alerts.length ? <div className="alert-row"><span className="alert-symbol"><AlertTriangle size={17} /></span><div><strong>{database.alerts[0]}</strong><span>Today · Monitoring system</span></div><StatusPill tone="amber">Review</StatusPill><button className="icon-button" aria-label="Acknowledge alert" onClick={() => updateDatabase({ ...database, alerts: [] })}><Check size={15} /></button></div> : <div className="empty-state"><Check size={18} /> No active alerts</div>}</section></div></>
+  return <>
+    <PageHeading eyebrow="Patient dashboard" title={`Welcome, ${user.name}`} subtitle="Your patient information from VITALYX." action={<button className="button button-danger" onClick={() => setShowEmergency(true)}><Siren size={17} /> Need urgent help</button>} />
+    {!dashboard.patientId && <div className="notice-banner"><span><ShieldCheck size={18} /><strong>Patient profile not found</strong><small>Ask an administrator to verify the patient account setup.</small></span></div>}
+    <div className="stats-grid">
+      <StatCard label="Recent readings" value={String(dashboard.observations.length)} note="Latest readings loaded" icon={HeartPulse} tone="blue" />
+      <StatCard label="Open alerts" value={String(dashboard.openAlertsCount)} note="Authorized active alerts" icon={AlertTriangle} tone={dashboard.openAlertsCount ? 'amber' : 'green'} />
+      <StatCard label="Upcoming appointments" value={String(dashboard.upcomingAppointmentCount)} note="Scheduled appointments" icon={CalendarDays} tone="violet" />
+      <StatCard label="Demo routine progress" value={`${database.routineDone.filter(Boolean).length} / 5`} note="Stored in this browser only" icon={ClipboardList} tone="blue" />
+    </div>
+    <div className="dashboard-grid">
+      <section className="panel health-panel">
+        <div className="panel-heading"><div><span className="eyebrow">Patient record</span><h3>Latest health readings</h3></div><button className="icon-button" onClick={() => navigate('/patient/health')} aria-label="View all health readings"><ArrowRight size={17} /></button></div>
+        {recentObservations.length ? <div className="metric-list">{recentObservations.slice(0, 4).map((observation) => <MetricRow key={`${observation.id}-${observation.measured_at}`} label={observationLabel(observation.code)} value={String(observation.value)} unit={observation.unit} note={formatRecordedAt(observation.measured_at)} trend="Recorded" icon={Activity} tone="blue" />)}</div> : <div className="empty-state">No health readings are available yet.</div>}
+      </section>
+      <section className="panel routine-panel">
+        <div className="panel-heading"><div><span className="eyebrow">Demo workflow</span><h3>Daily routine</h3></div><button className="text-button" onClick={() => navigate('/patient/routines')}>See all <ArrowRight size={15} /></button></div>
+        <div className="routine-progress"><div><strong>{database.routineDone.filter(Boolean).length} of 5</strong><span>tasks completed locally</span></div><div className="progress-bar"><i style={{ width: `${database.routineDone.filter(Boolean).length * 20}%` }} /></div></div>
+        <div className="task-list">{['Morning medication', '20 minute walk', 'Drink 6 glasses of water'].map((task, index) => <button className={`task-row ${database.routineDone[index] ? 'done' : ''}`} key={task} onClick={() => { const next = [...database.routineDone]; next[index] = !next[index]; updateDatabase({ ...database, routineDone: next }) }}><span className="check-box">{database.routineDone[index] && <Check size={14} />}</span><span>{task}</span>{database.routineDone[index] ? <small>Done</small> : <ChevronRight size={15} />}</button>)}</div>
+      </section>
+    </div>
+    <div className="bottom-grid">
+      <section className="panel">
+        <div className="panel-heading"><div><span className="eyebrow">Next up</span><h3>Appointments</h3></div><button className="text-button" onClick={() => navigate('/patient/appointments')}>View calendar <ArrowRight size={15} /></button></div>
+        {dashboard.appointments[0] ? <div className="simple-row"><span className="time-block">{formatAppointmentDate(dashboard.appointments[0].starts_at)}</span><div><strong>{dashboard.appointments[0].appointment_type}</strong><span>{dashboard.appointments[0].status}</span></div></div> : <div className="empty-state">No upcoming appointments are available.</div>}
+      </section>
+      <section className="panel alert-panel">
+        <div className="panel-heading"><div><span className="eyebrow">Patient record</span><h3>Recent alerts</h3></div><Bell size={18} className="muted-icon" /></div>
+        {dashboard.alerts.length ? dashboard.alerts.slice(0, 3).map((alert) => <div className="alert-row" key={alert.id}><span className="alert-symbol"><AlertTriangle size={17} /></span><div><strong>{alert.summary || alert.type}</strong><span>{formatRecordedAt(alert.created_at)}</span></div><StatusPill tone="amber">{alert.status}</StatusPill></div>) : <div className="empty-state"><Check size={18} /> No open alerts.</div>}
+      </section>
+    </div>
+  </>
 }
 
 function MetricRow({ label, value, unit, note, trend, icon: MetricIcon, tone }: { label: string; value: string; unit: string; note: string; trend: string; icon: Icon; tone: string }) { return <div className="metric-row"><span className={`metric-icon ${tone}`}><MetricIcon size={17} /></span><div><strong>{label}</strong><small>{note}</small></div><div className="metric-value"><strong>{value}<small>{unit}</small></strong><span>{trend}</span></div></div> }
 
-function PatientHealth() { return <><PageHeading eyebrow="Health monitoring" title="Your health picture" subtitle="Demonstration readings from your connected health profile." action={<span className="demo-label"><span /> Demo data</span>} /><div className="health-grid">{[['Heart rate', '64', 'BPM', 'Within baseline', 'red'], ['Blood oxygen', '98', '%', 'Excellent', 'blue'], ['HRV', '58', 'MS', 'Healthy range', 'violet'], ['Skin temperature', '36.5', '°C', 'Normal', 'amber'], ['Activity', '8,420', 'STEPS', '68% of goal', 'green'], ['Sleep', '7h 42m', '', 'Good recovery', 'blue']].map(([label, value, unit, note, tone]) => <div className="health-metric-card" key={label}><div className="metric-card-top"><span className={`metric-icon ${tone}`}><Activity size={17} /></span><StatusPill tone="green">Normal</StatusPill></div><small>{label}</small><strong>{value}<em>{unit}</em></strong><span className="metric-note">{note} · Updated 5 min ago</span><TrendChart color={tone} /></div>)}</div><div className="panel insight-panel"><div className="insight-icon"><ShieldCheck size={19} /></div><div><strong>Your readings look consistent today</strong><p>These are demonstration measurements for your project prototype, not medical advice or a diagnosis.</p></div></div></> }
+function PatientHealth({ observations }: { observations: Observation[] }) {
+  const latest = latestObservations(observations)
+  return <>
+    <PageHeading eyebrow="Health monitoring" title="Your health picture" subtitle="Read-only measurements from your patient record." />
+    {latest.length
+      ? <div className="health-grid">{latest.map((observation) => <div className="health-metric-card" key={`${observation.id}-${observation.measured_at}`}><div className="metric-card-top"><span className="metric-icon blue"><Activity size={17} /></span><StatusPill tone="blue">Recorded</StatusPill></div><small>{observationLabel(observation.code)}</small><strong>{observation.value}<em>{observation.unit}</em></strong><span className="metric-note">{formatRecordedAt(observation.measured_at)}</span></div>)}</div>
+      : <div className="panel data-state">No health measurements are available in your patient record yet.</div>}
+    <div className="panel insight-panel"><div className="insight-icon"><ShieldCheck size={19} /></div><div><strong>Measurements shown as recorded</strong><p>These values are not interpreted as a diagnosis or medical recommendation. Contact your care team with questions.</p></div></div>
+  </>
+}
 
-function RoutinePage({ routineDone, setRoutineDone }: { routineDone: boolean[]; setRoutineDone: (value: boolean[]) => void }) { const tasks = ['Morning medication', 'Morning walk', 'Drink sufficient water', 'Light exercise', 'Evening medication']; return <><PageHeading eyebrow="Daily routine" title="Small steps, steady progress" subtitle="A simple checklist prescribed for your day." /><div className="routine-layout"><section className="panel routine-large"><div className="routine-summary"><div className="big-progress"><strong>{Math.round(routineDone.filter(Boolean).length / tasks.length * 100)}%</strong><span>complete today</span></div><div><h3>Tuesday’s routine</h3><p>{routineDone.filter(Boolean).length === tasks.length ? 'You’ve completed everything. Wonderful work.' : 'You’re building a good rhythm. Keep going.'}</p></div></div>{tasks.map((task, index) => <button className={`large-task ${routineDone[index] ? 'done' : ''}`} key={task} onClick={() => { const next = [...routineDone]; next[index] = !next[index]; setRoutineDone(next) }}><span className="check-box">{routineDone[index] && <Check size={15} />}</span><span><strong>{task}</strong><small>{index === 0 || index === 4 ? 'As prescribed · with water' : 'Personal wellbeing goal'}</small></span><span className="task-time">{index < 2 ? 'Morning' : index === 4 ? 'Evening' : 'Anytime'}</span></button>)}</section><aside className="panel week-panel"><span className="eyebrow">This week</span><h3>Consistency</h3><div className="week-bars">{['M', 'T', 'W', 'T', 'F', 'S', 'S'].map((day, index) => <div key={`${day}-${index}`}><i style={{ height: `${[78, 64, 46, 22, 12, 8, 8][index]}%` }} /><small>{day}</small></div>)}</div><strong className="week-score">82% <small>weekly average</small></strong></aside></div></> }
+function RoutinePage({ routineDone, setRoutineDone }: { routineDone: boolean[]; setRoutineDone: (value: boolean[]) => void }) { const tasks = ['Morning medication', 'Morning walk', 'Drink sufficient water', 'Light exercise', 'Evening medication']; return <><PageHeading eyebrow="Demo routine" title="Small steps, steady progress" subtitle="Sample tasks stored in this browser; not prescribed care." /><div className="routine-layout"><section className="panel routine-large"><div className="routine-summary"><div className="big-progress"><strong>{Math.round(routineDone.filter(Boolean).length / tasks.length * 100)}%</strong><span>complete today</span></div><div><h3>Demo routine</h3><p>{routineDone.filter(Boolean).length === tasks.length ? 'You’ve completed everything. Wonderful work.' : 'You’re building a good rhythm. Keep going.'}</p></div></div>{tasks.map((task, index) => <button className={`large-task ${routineDone[index] ? 'done' : ''}`} key={task} onClick={() => { const next = [...routineDone]; next[index] = !next[index]; setRoutineDone(next) }}><span className="check-box">{routineDone[index] && <Check size={15} />}</span><span><strong>{task}</strong><small>{index === 0 || index === 4 ? 'Example only · not a prescription' : 'Example wellbeing task'}</small></span><span className="task-time">{index < 2 ? 'Morning' : index === 4 ? 'Evening' : 'Anytime'}</span></button>)}</section><aside className="panel week-panel"><span className="eyebrow">Demo data</span><h3>Consistency</h3><div className="week-bars">{['M', 'T', 'W', 'T', 'F', 'S', 'S'].map((day, index) => <div key={`${day}-${index}`}><i style={{ height: `${[78, 64, 46, 22, 12, 8, 8][index]}%` }} /><small>{day}</small></div>)}</div><strong className="week-score">82% <small>sample weekly average</small></strong></aside></div></> }
 
-function MedicationPage() { return <><PageHeading eyebrow="Medication plan" title="Your medications" subtitle="Prescriptions shared by your care team." /><div className="medication-list">{[['Lisinopril', '10 mg', 'Once daily · Morning', 'Take with or without food'], ['Vitamin D3', '1000 IU', 'Once daily · Morning', 'Take with breakfast'], ['Atorvastatin', '20 mg', 'Once daily · Evening', 'Take at bedtime']].map(([name, dose, timing, instruction]) => <div className="panel medication-card" key={name}><span className="pill-icon"><Pill size={19} /></span><div><h3>{name}</h3><strong>{dose}</strong><p>{timing}</p><small>{instruction}</small></div><StatusPill>Active</StatusPill></div>)}</div><div className="info-callout"><CircleHelp size={18} /><span><strong>Need to make a change?</strong> Medication details can only be updated by your doctor. <button className="text-button">Contact care team <ArrowRight size={14} /></button></span></div></> }
-function AppointmentsPage({ appointments }: { appointments: ReturnType<typeof loadDatabase>['appointments'] }) { return <><PageHeading eyebrow="Care calendar" title="Appointments" subtitle="Stay connected to your care team." action={<button className="button button-primary" onClick={() => window.alert('Appointment request started. Connect this action to the backend booking service next.')}><Plus size={17} /> Request appointment</button>} /><div className="panel table-panel"><div className="table-heading"><h3>Upcoming</h3><span>{appointments.length} appointments</span></div>{appointments.slice(0, 2).map((appointment) => <div className="appointment-row detailed" key={appointment.time}><span className="date-tile"><b>{appointment.time.split(':')[0]}</b><small>NOV</small></span><div><strong>Dr. Jordan Lee</strong><span>{appointment.type} · Video call</span></div><span className="time-label">{appointment.time} AM</span><StatusPill tone={appointment.status === 'Confirmed' ? 'green' : 'blue'}>{appointment.status}</StatusPill></div>)}</div><div className="panel"><div className="panel-heading"><div><span className="eyebrow">Care team</span><h3>People in your corner</h3></div></div><div className="care-team"><span className="avatar avatar-lg">JL</span><div><strong>Dr. Jordan Lee</strong><span>Primary care · Cardiology</span></div><button className="icon-button" onClick={() => window.alert('Secure messaging will be connected to the care team service.')}><MessageCircle size={17} /></button></div></div></> }
-function RecordsPage() { return <><PageHeading eyebrow="Your records" title="Medical records" subtitle="A private, organised view of your care history." /><div className="record-grid"><div className="panel record-card"><span className="record-icon blue"><FileText size={19} /></span><div><strong>Recovery consultation</strong><span>Dr. Jordan Lee · 12 Nov 2026</span></div><ChevronRight size={16} /></div><div className="panel record-card"><span className="record-icon amber"><FileText size={19} /></span><div><strong>Blood test results</strong><span>Uploaded · 04 Nov 2026</span></div><ChevronRight size={16} /></div><div className="panel record-card"><span className="record-icon green"><Pill size={19} /></span><div><strong>Current prescriptions</strong><span>3 active medications</span></div><ChevronRight size={16} /></div></div></> }
+function MedicationPage() { return <><PageHeading eyebrow="Demo medication list" title="Sample medications" subtitle="Example content only; prescriptions are not connected to your care team." /><div className="medication-list">{[['Lisinopril', '10 mg', 'Once daily · Morning', 'Take with or without food'], ['Vitamin D3', '1000 IU', 'Once daily · Morning', 'Take with breakfast'], ['Atorvastatin', '20 mg', 'Once daily · Evening', 'Take at bedtime']].map(([name, dose, timing, instruction]) => <div className="panel medication-card" key={name}><span className="pill-icon"><Pill size={19} /></span><div><h3>{name}</h3><strong>{dose}</strong><p>{timing}</p><small>{instruction}</small></div><StatusPill>Example</StatusPill></div>)}</div><div className="info-callout"><CircleHelp size={18} /><span><strong>Need medication advice?</strong> Contact your clinician. This page does not display your actual prescriptions.</span></div></> }
+function AppointmentsPage({ appointments, count }: { appointments: PatientAppointment[]; count: number }) {
+  return <>
+    <PageHeading eyebrow="Care calendar" title="Appointments" subtitle="Upcoming appointments from your patient record." />
+    <div className="panel table-panel">
+      <div className="table-heading"><h3>Upcoming</h3><span>{count} appointments</span></div>
+      {appointments.length
+        ? appointments.map((appointment) => <div className="appointment-row detailed" key={appointment.id}><span className="date-tile"><b>{new Date(appointment.starts_at).toLocaleDateString(undefined, { day: '2-digit' })}</b><small>{new Date(appointment.starts_at).toLocaleDateString(undefined, { month: 'short' }).toUpperCase()}</small></span><div><strong>{appointment.appointment_type}</strong><span>{formatAppointmentDate(appointment.starts_at)}</span></div><StatusPill tone={appointment.status.toLowerCase() === 'confirmed' ? 'green' : 'blue'}>{appointment.status}</StatusPill></div>)
+        : <div className="empty-state">No upcoming appointments are available.</div>}
+    </div>
+  </>
+}
+function RecordsPage() { return <><PageHeading eyebrow="Demo records" title="Sample medical records" subtitle="Example content only; these files are not connected to your medical history." /><div className="record-grid"><div className="panel record-card"><span className="record-icon blue"><FileText size={19} /></span><div><strong>Recovery consultation</strong><span>Example · 12 Nov 2026</span></div><ChevronRight size={16} /></div><div className="panel record-card"><span className="record-icon amber"><FileText size={19} /></span><div><strong>Blood test results</strong><span>Example · 04 Nov 2026</span></div><ChevronRight size={16} /></div><div className="panel record-card"><span className="record-icon green"><Pill size={19} /></span><div><strong>Sample prescriptions</strong><span>Example content only</span></div><ChevronRight size={16} /></div></div></> }
 
 function LegacyAdminPage({ path, navigate }: { path: string; navigate: (nextPath: string) => void }) { if (path === '/admin/patients' || path === '/admin/monitoring') return <><PageHeading eyebrow="Family care" title="People you care for" subtitle="A clear view of your authorised family members." action={<button className="button button-primary"><Plus size={17} /> Add patient</button>} /><div className="stats-grid"><StatCard label="Patients monitored" value="4" note="All connections active" icon={Users} tone="blue" /><StatCard label="Need attention" value="1" note="Review today" icon={AlertTriangle} tone="amber" /><StatCard label="Active alerts" value="2" note="1 acknowledged" icon={Bell} tone="red" /><StatCard label="Next appointment" value="09:30" note="Eleanor Wright" icon={CalendarDays} tone="green" /></div><div className="panel table-panel"><div className="table-heading"><h3>Monitoring overview</h3><div className="search-box"><Search size={16} /><input placeholder="Search patients" /></div></div>{patients.map((patient) => <div className="patient-row" key={patient.name}><span className="avatar avatar-sm">{patient.initials}</span><div className="patient-name"><strong>{patient.name}</strong><span>{patient.detail}</span></div><div className="patient-reading"><small>Heart rate</small><strong>{patient.rate}</strong></div><div><StatusPill tone={patient.color}>{patient.status}</StatusPill><small className="updated">Updated {patient.updated}</small></div><button className="icon-button" onClick={() => navigate('/admin/patients/1')}><ChevronRight size={17} /></button></div>)}</div></>; return <><PageHeading eyebrow="Family care" title="Good morning, Maya" subtitle="Here’s what needs your attention today." /><div className="notice-banner"><span><ShieldCheck size={18} /><strong>All patients are connected</strong><small>One person in your care may need a review today.</small></span><button className="text-button" onClick={() => navigate('/admin/monitoring')}>Open monitoring <ArrowRight size={15} /></button></div><div className="stats-grid"><StatCard label="Registered patients" value="4" note="Across your care circle" icon={Users} tone="blue" /><StatCard label="Monitoring now" value="4 / 4" note="All devices online" icon={Activity} tone="green" /><StatCard label="Needs attention" value="1" note="Eleanor Wright" icon={AlertTriangle} tone="amber" /><StatCard label="Appointments" value="3" note="This week" icon={CalendarDays} tone="violet" /></div><div className="dashboard-grid"><section className="panel"><div className="panel-heading"><div><span className="eyebrow">Monitoring</span><h3>Family overview</h3></div><button className="text-button" onClick={() => navigate('/admin/monitoring')}>View all <ArrowRight size={15} /></button></div>{patients.slice(0, 3).map((patient) => <div className="patient-row compact" key={patient.name}><span className="avatar avatar-sm">{patient.initials}</span><div className="patient-name"><strong>{patient.name}</strong><span>{patient.rate} · Updated {patient.updated}</span></div><StatusPill tone={patient.color}>{patient.status}</StatusPill></div>)}</section><section className="panel"><div className="panel-heading"><div><span className="eyebrow">Today</span><h3>Upcoming appointments</h3></div></div>{appointments.slice(0, 2).map((item) => <div className="simple-row" key={item.time}><span className="time-block">{item.time}</span><div><strong>{item.person}</strong><span>{item.type}</span></div></div>)}</section></div></> }
 

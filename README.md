@@ -78,11 +78,20 @@ Healthcare emergencies often face delays due to fragmented medical records, manu
 
 ## Current Frontend Persistence
 
-The VITALYX prototype currently uses a typed local mock database in `src/db.ts`. It stores demonstration routines, alerts, and appointment changes in browser `localStorage`, so interactions remain available after navigation and refresh. This is intentionally local-only and contains no real patient information.
+The VITALYX prototype uses Supabase Auth and reads patient observations, alerts, and upcoming appointments from PostgreSQL. Demonstration routines and the remaining non-patient workflows still use a typed local mock database in `src/db.ts` and browser `localStorage`.
 
-Public **Create account** opens the common registration form for Admin, Doctor, and Emergency Service accounts. Admin accounts become active immediately; Doctor and Emergency Service accounts are stored as pending until the special-permission policy is defined. Patients cannot self-register. Signed-in administrators can use **Add member** repeatedly to create authorised patient or staff member accounts with Mail, Number, Name, Date of Birth, Profession, Address, role, and password.
+Public **Create account** registers a patient with Supabase Auth. The auth trigger creates the corresponding VITALYX account, patient role, and profile. If email confirmation is enabled in Supabase, the user must confirm their email before signing in. Admin, Doctor, and Emergency accounts must be provisioned through an authorized process; public users cannot choose those roles.
 
-For production, replace the `loadDatabase` and `saveDatabase` functions with authenticated API calls to the planned Django/FastAPI service and PostgreSQL/Supabase database. Do not store real health records or credentials in browser storage.
+Sign-in and session restoration use Supabase Auth. Apply `database/003_patient_dashboard_rls.sql` after the first two migrations to provision patient records and enable read-only, patient-scoped access for the connected dashboard. Routines, medications, records, staff provisioning, and other workflows remain demo or unconnected. Do not treat this prototype as production-ready; validate RLS with separate patient accounts before loading real health records.
+
+### Enable Google sign-in
+
+1. In Google Cloud Console, create a **Web application** OAuth client. Add the callback URL shown by Supabase under **Authentication → Providers → Google** as an authorized redirect URI.
+2. In Supabase, enable the Google provider and enter the OAuth client ID and secret. Keep the client secret in Supabase; never put it in `VITE_*` variables or browser code.
+3. Under **Authentication → URL Configuration**, set the production Site URL and allow the app callback origins, including `http://127.0.0.1:5173/**` for local Vite development (and `http://localhost:5173/**` if used).
+4. Restart the Vite server and use **Continue with Google** on the sign-in or registration screen.
+
+The app redirects OAuth back to its current origin. The matching origin must be in Supabase's allowed redirect URLs.
 
 ## Future Enhancements
 
